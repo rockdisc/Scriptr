@@ -1,5 +1,6 @@
 # Scriptr
 
+This was vibe-coded. All I did was think of the ideas, the name, and pushed it to git. I do not want people to use this outside of personal use at all. This is just designed for my personal use, but I will not stop others from using it, just do not tie profits to this. 
 Scriptr is a local-first Markdown writing app with private, file-embedded comments, browser autosave history, reader comments, and rehearsal mode. It is designed to work as a personal app and as a public static website that anyone can use without accounts, servers, analytics, or runtime network calls.
 
 ## Features

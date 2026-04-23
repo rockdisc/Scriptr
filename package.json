@@ -1,0 +1,64 @@
+{
+  "name": "scriptr",
+  "version": "0.1.0",
+  "description": "A local-first Markdown writing app with private comments and offline desktop support.",
+  "private": true,
+  "type": "module",
+  "main": "dist-electron/main.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "build:electron": "tsc -p tsconfig.electron.json",
+    "desktop:dev": "concurrently -k \"vite --host 127.0.0.1 --port 5173 --strictPort\" \"wait-on http://127.0.0.1:5173 && tsc -p tsconfig.electron.json && electron .\"",
+    "desktop:build": "npm run build && npm run build:electron",
+    "dist": "npm run desktop:build && electron-builder",
+    "preview": "vite preview",
+    "lint": "tsc --noEmit"
+  },
+  "build": {
+    "appId": "app.scriptr.desktop",
+    "productName": "Scriptr",
+    "files": [
+      "dist/**",
+      "dist-electron/**",
+      "package.json"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "category": "Office"
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "category": "public.app-category.productivity"
+    }
+  },
+  "dependencies": {
+    "@codemirror/lang-markdown": "^6.5.0",
+    "@uiw/react-codemirror": "^4.25.9",
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.7",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.2",
+    "concurrently": "^9.2.1",
+    "electron": "^39.2.7",
+    "electron-builder": "^26.0.12",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.0",
+    "wait-on": "^9.0.3"
+  }
+}

@@ -87,6 +87,10 @@ export function replaceBlockText(markdown: string, block: ReaderBlock, text: str
   return markdown;
 }
 
+export function replaceBlockMarkdown(markdown: string, block: ReaderBlock, raw: string) {
+  return markdown.slice(0, block.start) + raw + markdown.slice(block.end);
+}
+
 function replaceVisibleTextPreservingMarkers(markdown: string, start: number, end: number, text: string) {
   const raw = markdown.slice(start, end);
   const pieces: Array<

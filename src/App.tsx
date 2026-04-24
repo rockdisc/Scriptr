@@ -3,10 +3,13 @@ import CodeMirror from "@uiw/react-codemirror";
 import {
   ChangeEvent,
   FocusEvent,
+  FormEvent,
   KeyboardEvent as ReactKeyboardEvent,
   MouseEvent as ReactMouseEvent,
   ReactNode,
   useEffect,
+  useLayoutEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -20,7 +23,7 @@ import {
   parseComments,
   replaceComment,
 } from "./markdownComments";
-import { blockPlainText, createReaderBlocks, replaceBlockText } from "./markdownPreview";
+import { blockPlainText, createReaderBlocks, replaceBlockMarkdown, replaceBlockText } from "./markdownPreview";
 import type {
   CommentCategory,
   BrowserDraft,
@@ -42,20 +45,12 @@ type Settings = {
   wpm: number;
   showEditor: boolean;
   showReader: boolean;
-  showComments: boolean;
-  showOutline: boolean;
-  showSnapshots: boolean;
-  showHistory: boolean;
 };
 
 const defaultSettings: Settings = {
   wpm: 140,
   showEditor: true,
   showReader: true,
-  showComments: true,
-  showOutline: false,
-  showSnapshots: false,
-  showHistory: false,
 };
 
 const settingsKey = "scriptr-settings";
@@ -63,9 +58,13 @@ const legacySettingsKey = "speech-writer-settings";
 const snapshotKeyPrefix = "scriptr-snapshots";
 const legacySnapshotKeyPrefix = "speech-writer-snapshots";
 const draftHistoryKey = "scriptr-browser-drafts";
+const splitRatioKey = "scriptr-split-ratio";
 const commentCategories: CommentCategory[] = ["blocking", "voice", "change position", "note"];
+const editorExtensions = [markdownExtension()];
 
 type RehearsalMode = "countdown" | "stopwatch";
+type SidebarPanel = "comments" | "outline" | "snapshots" | "history";
+type PrimaryView = "editor" | "preview" | "split";
 
 type RehearsalState = {
   open: boolean;
@@ -155,6 +154,7 @@ function isFormField(target: EventTarget | null) {
 }
 
 export function App() {
+  const topbarRef = useRef<HTMLElement>(null);
   const [markdown, setMarkdown] = useState(starterMarkdown);
   const [fileName, setFileName] = useState("untitled.md");
   const [documentHash, setDocumentHash] = useState(() => hashDocument(starterMarkdown));
@@ -167,6 +167,13 @@ export function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [rehearsalSetupOpen, setRehearsalSetupOpen] = useState(false);
   const [settings, setSettings] = useState<Settings>(() => loadSettings());
+  const [activeSidebar, setActiveSidebar] = useState<SidebarPanel | null>(null);
+  const [focusMode, setFocusMode] = useState(false);
+  const [splitRatio, setSplitRatio] = useState(() => {
+    const raw = localStorage.getItem(splitRatioKey);
+    const parsed = raw ? Number(raw) : 0.56;
+    return Number.isFinite(parsed) ? Math.min(0.75, Math.max(0.25, parsed)) : 0.56;
+  });
   const [snapshotVersion, setSnapshotVersion] = useState(0);
   const [draftVersion, setDraftVersion] = useState(0);
   const [rehearsal, setRehearsal] = useState<RehearsalState>({
@@ -180,9 +187,11 @@ export function App() {
   const previewRef = useRef<HTMLElement>(null);
   const commentRefs = useRef<Record<string, HTMLElement | null>>({});
   const readerBlockRefs = useRef<Record<string, HTMLElement | null>>({});
+  const splitDragRef = useRef<{ pointerId: number } | null>(null);
   const pendingFocusSource = useRef<number | null>(null);
   const readerCaretSource = useRef<number | null>(null);
-  const lastCommentSource = useRef<"editor" | "reader" | null>(null);
+  const readerSelectionSource = useRef<{ start: number; end: number } | null>(null);
+  const lastCommentSource = useRef<"editor" | "preview" | null>(null);
 
   const comments = parseComments(markdown);
   const readerBlocks = createReaderBlocks(markdown);
@@ -199,6 +208,32 @@ export function App() {
   const browserDrafts = loadBrowserDrafts(draftVersion);
   const desktop = (window as ScriptrDesktopWindow).scriptrDesktop;
   const supportsDirectFiles = "showOpenFilePicker" in window && "showSaveFilePicker" in window;
+  const supportLabel = desktop?.isDesktop
+    ? "Offline desktop file access"
+    : supportsDirectFiles
+    ? "Direct browser file access"
+    : "Import/export fallback";
+  const primaryView: PrimaryView = settings.showEditor && settings.showReader
+    ? "split"
+    : settings.showEditor
+    ? "editor"
+    : "preview";
+  const visibleEditor = focusMode ? primaryView !== "preview" : settings.showEditor;
+  const visibleReader = focusMode ? primaryView !== "editor" : settings.showReader;
+  const visibleSidebar = focusMode ? null : activeSidebar;
+  const splitGridColumns = `${Math.round(splitRatio * 1000)}fr 8px ${Math.round((1 - splitRatio) * 1000)}fr`;
+  const contentStageStyle = visibleEditor && visibleReader
+    ? { gridTemplateColumns: splitGridColumns }
+    : undefined;
+  const fileStem = fileName.replace(/\.(md|markdown|txt)$/i, "") || "untitled";
+  const editorPanelLabel = `Markdown editor for ${fileName}`;
+  const previewPanelLabel = "Live Preview editor";
+  const utilitySummary = useMemo(() => ({
+    comments: comments.length,
+    outline: outlineItems.length,
+    history: browserDrafts.length,
+    snapshots: snapshots.length,
+  }), [browserDrafts.length, comments.length, outlineItems.length, snapshots.length]);
 
   useEffect(() => {
     const handler = (event: BeforeUnloadEvent) => {
@@ -236,6 +271,10 @@ export function App() {
   }, [settings]);
 
   useEffect(() => {
+    localStorage.setItem(splitRatioKey, splitRatio.toFixed(3));
+  }, [splitRatio]);
+
+  useEffect(() => {
     const timeout = window.setTimeout(() => {
       const draft: BrowserDraft = {
         id: getDraftId(fileName, documentHash),
@@ -268,21 +307,46 @@ export function App() {
 
   useEffect(() => {
     const target = pendingFocusSource.current;
-    if (target == null) return;
-    pendingFocusSource.current = null;
-
     requestAnimationFrame(() => {
-      const focusBlock = createReaderBlocks(markdown).find(
-        (block) =>
-          (block.textStart <= target && target <= block.textEnd) ||
-          block.listItems?.some((item) => item.textStart <= target && target <= item.textEnd),
-      );
-      const item =
-        focusBlock?.listItems?.find((candidate) => candidate.textStart <= target && target <= candidate.textEnd) ??
-        focusBlock;
-      readerBlockRefs.current[item?.id ?? ""]?.focus();
+      if (target != null) {
+        pendingFocusSource.current = null;
+        focusReaderSurfaceAtSource(target);
+        return;
+      }
+
+      if (lastCommentSource.current !== "preview" || !readerSelectionSource.current) {
+        return;
+      }
+
+      const { start, end } = readerSelectionSource.current;
+      setReaderSelectionBySource(start, end);
     });
   }, [markdown]);
+
+  useLayoutEffect(() => {
+    const element = topbarRef.current;
+    if (!element) return;
+
+    const root = document.documentElement;
+    const updateTopbarOffset = () => {
+      const rect = element.getBoundingClientRect();
+      const topInset = rect.top;
+      const gutter = 4;
+      root.style.setProperty("--topbar-height", `${Math.ceil(rect.height)}px`);
+      root.style.setProperty("--chrome-offset", `${Math.ceil(topInset + rect.height + gutter)}px`);
+      root.style.setProperty("--panel-overlay-top", `${Math.ceil(topInset + rect.height + gutter)}px`);
+    };
+
+    updateTopbarOffset();
+    const observer = new ResizeObserver(updateTopbarOffset);
+    observer.observe(element);
+    window.addEventListener("resize", updateTopbarOffset);
+
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", updateTopbarOffset);
+    };
+  }, []);
 
   function updateMarkdown(value: string) {
     setMarkdown(value);
@@ -291,6 +355,32 @@ export function App() {
 
   function updateSettings(patch: Partial<Settings>) {
     setSettings((current) => ({ ...current, ...patch }));
+  }
+
+  function setPrimaryView(view: PrimaryView) {
+    if (view === "editor") {
+      updateSettings({ showEditor: true, showReader: false });
+      return;
+    }
+
+    if (view === "preview") {
+      updateSettings({ showEditor: false, showReader: true });
+      return;
+    }
+
+    updateSettings({ showEditor: true, showReader: true });
+  }
+
+  function toggleSidebar(panel: SidebarPanel) {
+    setActiveSidebar((current) => (current === panel ? null : panel));
+  }
+
+  function renameFile(nextName: string) {
+    const normalized = nextName.trim() || "untitled.md";
+    if (normalized === fileName) return;
+    setFileName(normalized);
+    setDirty(true);
+    setStatus(`Renamed document to ${normalized}.`);
   }
 
   async function openFile() {
@@ -429,7 +519,7 @@ export function App() {
 
   function downloadCleanMarkdown() {
     const clean = exportCleanMarkdown(markdown);
-    const downloadName = fileName.replace(/\.(md|markdown|txt)$/i, "") || "scriptr";
+    const downloadName = fileStem || "scriptr";
     if (desktop?.isDesktop) {
       desktop.exportMarkdown(`${downloadName}.clean.md`, `${clean}\n`).then((result) => {
         if (result) setStatus(`Exported clean Markdown to ${result.fileName}.`);
@@ -477,7 +567,7 @@ export function App() {
       );
       updateMarkdown(result.markdown);
       setActiveCommentId(result.id);
-      setStatus(`Added ${category} reader selection comment.`);
+      setStatus(`Added ${category} Live Preview selection comment.`);
       return;
     }
 
@@ -523,11 +613,13 @@ export function App() {
   }
 
   function focusReaderBlock(id: string) {
-    updateSettings({ showReader: true });
+    if (!settings.showReader) {
+      updateSettings({ showReader: true });
+    }
     requestAnimationFrame(() => {
       const block = readerBlockRefs.current[id];
       block?.scrollIntoView({ behavior: "smooth", block: "center" });
-      block?.focus();
+      focusReaderSurfaceAtSource(Number(block?.dataset.textStart ?? 0));
     });
   }
 
@@ -621,33 +713,41 @@ export function App() {
     }
   }
 
-  function commitReaderEdit(block: ReaderBlock, value: string) {
-    const currentText = blockPlainText(block);
-    const normalized = normalizeReaderText(value);
-    if (normalized === currentText) return;
+  function handlePreviewInput(block: ReaderBlock, element: HTMLElement, announce = false) {
+    rememberPreviewSelection(block, element);
+    const normalized = normalizeReaderText(element.innerText);
+    if (normalized === blockPlainText(block)) return;
     updateMarkdown(replaceBlockText(markdown, block, normalized));
-    setStatus("Updated Markdown from read mode.");
+    if (announce) {
+      setStatus("Updated Markdown from Live Preview.");
+    }
   }
 
-  function handleReaderKeyDown(
-    event: ReactKeyboardEvent<HTMLElement>,
-    block: ReaderBlock,
-  ) {
+  function handleReaderKeyDown(event: ReactKeyboardEvent<HTMLElement>, block: ReaderBlock) {
     if (event.key !== "Enter" || event.shiftKey || event.altKey || event.metaKey || event.ctrlKey) {
       return;
     }
 
     event.preventDefault();
-    const value = normalizeReaderText(event.currentTarget.innerText);
-    const offset = getCaretOffset(event.currentTarget);
+    const element = event.currentTarget;
+    rememberPreviewSelection(block, element);
+    const value = normalizeReaderText(element.innerText);
+    const offset = getCaretOffset(element);
+
+    if (block.listMarker) {
+      const result = insertListBreak(block, value, offset);
+      updateMarkdown(result.markdown);
+      pendingFocusSource.current = result.nextSource;
+      setStatus("Inserted new list item from Live Preview.");
+      return;
+    }
+
     const before = value.slice(0, offset);
     const after = value.slice(offset);
-    const separator = block.listMarker ? `\n${block.listMarker}` : "\n\n";
-    const replacement = `${before}${separator}${after}`;
-
+    const replacement = `${before}\n\n${after}`;
     updateMarkdown(replaceBlockText(markdown, block, replacement));
-    pendingFocusSource.current = block.textStart + before.length + separator.length;
-    setStatus(block.listMarker ? "Inserted new list item from read mode." : "Inserted new paragraph from read mode.");
+    pendingFocusSource.current = block.textStart + before.length + 2;
+    setStatus("Inserted new paragraph from Live Preview.");
   }
 
   function getReaderActiveRange() {
@@ -665,7 +765,7 @@ export function App() {
     const source = start ?? end;
     if (source == null) return null;
 
-    lastCommentSource.current = "reader";
+    lastCommentSource.current = "preview";
     if (selectionObject.isCollapsed || start === end) {
       return findNearestWordRange(markdown, source);
     }
@@ -704,56 +804,70 @@ export function App() {
     return readerCaretSource.current;
   }
 
-  function rememberReaderCaret(block: ReaderBlock, element: HTMLElement) {
+  function rememberPreviewSelection(block?: ReaderBlock, element?: HTMLElement) {
     const selectionObject = window.getSelection();
-    if (selectionObject && selectionObject.rangeCount > 0 && element.contains(selectionObject.anchorNode)) {
-      const range = selectionObject.getRangeAt(0);
-      const source = pointToSource(range.startContainer, range.startOffset);
-      if (source != null) {
-        readerCaretSource.current = source;
-        lastCommentSource.current = "reader";
-        return;
-      }
-    }
+    const root = previewRef.current;
+    if (!selectionObject || selectionObject.rangeCount === 0 || !root) return;
 
-    readerCaretSource.current = block.textStart;
-    lastCommentSource.current = "reader";
+    const range = selectionObject.getRangeAt(0);
+    if (!root.contains(range.commonAncestorContainer)) return;
+
+    const startBlock = getSelectionReaderBlock(range.startContainer) ?? block;
+    const endBlock = getSelectionReaderBlock(range.endContainer) ?? block;
+    if (!startBlock || !endBlock) return;
+
+    const startElement = readerBlockRefs.current[startBlock.id] ?? element;
+    const endElement = readerBlockRefs.current[endBlock.id] ?? element;
+    if (!startElement || !endElement) return;
+
+    const startOffset = getCaretOffsetWithin(startElement, range.startContainer, range.startOffset);
+    const endOffset = getCaretOffsetWithin(endElement, range.endContainer, range.endOffset);
+    const start = startBlock.textStart + startOffset;
+    const end = endBlock.textStart + endOffset;
+
+    readerCaretSource.current = end;
+    readerSelectionSource.current = { start, end };
+    lastCommentSource.current = "preview";
   }
 
-  function renderReaderBlock(block: ReaderBlock) {
-    const editableProps = {
-      contentEditable: block.kind === "heading" || block.kind === "paragraph",
-      suppressContentEditableWarning: true,
-      onFocus: (event: FocusEvent<HTMLElement>) => rememberReaderCaret(block, event.currentTarget),
-      onMouseUp: (event: ReactMouseEvent<HTMLElement>) => rememberReaderCaret(block, event.currentTarget),
-      onKeyUp: (event: ReactKeyboardEvent<HTMLElement>) => rememberReaderCaret(block, event.currentTarget),
-      onBlur: (event: FocusEvent<HTMLElement>) =>
-        commitReaderEdit(block, event.currentTarget.innerText),
-      onKeyDown: (event: ReactKeyboardEvent<HTMLElement>) => handleReaderKeyDown(event, block),
-    };
+  function renderReaderDocument() {
+    return (
+      <article
+        ref={previewRef}
+        className="speech-preview"
+        aria-label={previewPanelLabel}
+      >
+        {readerBlocks.map((block) => renderReaderBlockNode(block))}
+      </article>
+    );
+  }
 
+  function renderReaderBlockNode(block: ReaderBlock) {
     if (block.kind === "heading") {
-      return renderHeading(block, renderInlines(block), editableProps);
+      return renderHeading(block, renderInlines(block));
     }
 
     if (block.kind === "unordered-list" || block.kind === "ordered-list") {
       const List = block.kind === "ordered-list" ? "ol" : "ul";
       return (
-        <List key={block.id} className="reader-list">
+        <List key={block.id} className="reader-list" data-list-id={block.id}>
           {block.listItems?.map((item) => (
             <li
               key={item.id}
-              className="reader-block"
-              contentEditable
-              suppressContentEditableWarning
               ref={(element) => {
                 readerBlockRefs.current[item.id] = element;
               }}
-              onFocus={(event) => rememberReaderCaret(item, event.currentTarget)}
-              onMouseUp={(event) => rememberReaderCaret(item, event.currentTarget)}
-              onKeyUp={(event) => rememberReaderCaret(item, event.currentTarget)}
+              className="reader-node reader-list-item"
+              data-block-id={item.id}
+              data-text-start={item.textStart}
+              contentEditable
+              suppressContentEditableWarning
+              onFocus={(event) => rememberPreviewSelection(item, event.currentTarget)}
+              onMouseUp={(event) => rememberPreviewSelection(item, event.currentTarget)}
+              onKeyUp={(event) => rememberPreviewSelection(item, event.currentTarget)}
+              onInput={(event: FormEvent<HTMLElement>) => handlePreviewInput(item, event.currentTarget)}
+              onBlur={(event) => handlePreviewInput(item, event.currentTarget, true)}
               onKeyDown={(event) => handleReaderKeyDown(event, item)}
-              onBlur={(event) => commitReaderEdit(item, event.currentTarget.innerText)}
             >
               {renderInlines(item)}
             </li>
@@ -768,33 +882,199 @@ export function App() {
         ref={(element) => {
           readerBlockRefs.current[block.id] = element;
         }}
-        className="reader-block"
+        className="reader-node"
         data-block-id={block.id}
-        {...editableProps}
+        data-text-start={block.textStart}
+        contentEditable
+        suppressContentEditableWarning
+        onFocus={(event) => rememberPreviewSelection(block, event.currentTarget)}
+        onMouseUp={(event) => rememberPreviewSelection(block, event.currentTarget)}
+        onKeyUp={(event) => rememberPreviewSelection(block, event.currentTarget)}
+        onInput={(event: FormEvent<HTMLElement>) => handlePreviewInput(block, event.currentTarget)}
+        onBlur={(event) => handlePreviewInput(block, event.currentTarget, true)}
+        onKeyDown={(event) => handleReaderKeyDown(event, block)}
       >
         {renderInlines(block)}
       </p>
     );
   }
 
+  function renderSidebarPanel() {
+    if (visibleSidebar === "outline") {
+      return (
+        <aside className="utility-panel" aria-label="Outline">
+          <div className="panel-title">
+            <span>Outline</span>
+            <button className="ghost-button" onClick={() => setActiveSidebar(null)}>Close</button>
+          </div>
+          {outlineItems.length === 0 ? (
+            <p className="empty">No headings yet. Add #, ##, or ### headings to build an outline.</p>
+          ) : (
+            <nav className="outline-list">
+              {outlineItems.map((item) => (
+                <button
+                  key={item.id}
+                  className={`outline-item outline-level-${Math.min(3, item.level)}`}
+                  onClick={() => focusReaderBlock(item.id)}
+                >
+                  {item.title}
+                </button>
+              ))}
+            </nav>
+          )}
+        </aside>
+      );
+    }
+
+    if (visibleSidebar === "comments") {
+      return (
+        <aside className="utility-panel comments-panel" aria-label="Comments">
+          <div className="panel-title">
+            <span>Comments</span>
+            <button className="ghost-button" onClick={() => setActiveSidebar(null)}>Close</button>
+          </div>
+          {comments.length === 0 ? (
+            <p className="empty">No comments yet. Select text or place your cursor near a word, then press Option/Alt-C.</p>
+          ) : (
+            comments.map((comment) => (
+              <article
+                key={comment.id}
+                ref={(element) => {
+                  commentRefs.current[comment.id] = element;
+                }}
+                className={`comment-card ${comment.status} ${categoryClass(comment.category)} ${
+                  activeCommentId === comment.id ? "active" : ""
+                }`}
+                onClick={() => setActiveCommentId(comment.id)}
+              >
+                <div className="comment-meta">
+                  <span>{comment.anchor}</span>
+                  <span className={`category-chip ${categoryClass(comment.category)}`}>{comment.category}</span>
+                  <span>{comment.status}</span>
+                </div>
+                <label className="category-select">
+                  Category
+                  <select
+                    value={comment.category}
+                    onChange={(event) => changeCommentCategory(comment.id, event.target.value as CommentCategory)}
+                  >
+                    {commentCategories.map((category) => (
+                      <option key={category} value={category}>
+                        {category}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <textarea
+                  value={comment.text}
+                  onChange={(event) => editComment(comment.id, event.target.value)}
+                  aria-label={`Edit comment ${comment.id}`}
+                />
+                <div className="comment-actions">
+                  <button onClick={() => toggleResolved(comment.id)}>
+                    {comment.status === "resolved" ? "Reopen" : "Resolve"}
+                  </button>
+                  <button className="danger" onClick={() => removeComment(comment.id)}>
+                    Delete
+                  </button>
+                </div>
+              </article>
+            ))
+          )}
+        </aside>
+      );
+    }
+
+    if (visibleSidebar === "snapshots") {
+      return (
+        <aside className="utility-panel snapshots-panel" aria-label="Snapshots">
+          <div className="panel-title">
+            <span>Snapshots</span>
+            <button className="ghost-button" onClick={() => setActiveSidebar(null)}>Close</button>
+          </div>
+          <div className="snapshot-list">
+            <button onClick={createSnapshot}>Create Snapshot</button>
+            {snapshots.length === 0 ? (
+              <p className="empty">No local snapshots for this file/version yet.</p>
+            ) : (
+              snapshots.map((snapshot) => (
+                <article key={snapshot.id} className="snapshot-card">
+                  <div>
+                    <strong>{snapshot.title}</strong>
+                    <span>
+                      {new Date(snapshot.timestamp).toLocaleString()} - {snapshot.wordCount} words -{" "}
+                      {snapshot.commentCount} comments
+                    </span>
+                  </div>
+                  <div className="snapshot-actions">
+                    <button onClick={() => restoreSnapshot(snapshot)}>Restore</button>
+                    <button onClick={() => downloadSnapshot(snapshot)}>Download</button>
+                    <button className="danger" onClick={() => deleteSnapshot(snapshot.id)}>Delete</button>
+                  </div>
+                </article>
+              ))
+            )}
+          </div>
+        </aside>
+      );
+    }
+
+    if (visibleSidebar === "history") {
+      return (
+        <aside className="utility-panel history-panel" aria-label="Browser autosave history">
+          <div className="panel-title">
+            <span>History</span>
+            <button className="ghost-button" onClick={() => setActiveSidebar(null)}>Close</button>
+          </div>
+          <div className="snapshot-list">
+            {browserDrafts.length === 0 ? (
+              <p className="empty">No browser autosaves yet. Edits are saved here automatically.</p>
+            ) : (
+              browserDrafts.map((draft) => (
+                <article key={draft.id} className="snapshot-card">
+                  <div>
+                    <strong>{draft.fileName}</strong>
+                    <span>
+                      {new Date(draft.updatedAt).toLocaleString()} - {draft.wordCount} words -{" "}
+                      {draft.commentCount} comments
+                    </span>
+                  </div>
+                  <div className="snapshot-actions">
+                    <button onClick={() => restoreBrowserDraft(draft)}>Restore</button>
+                    <button onClick={() => downloadBrowserDraft(draft)}>Download</button>
+                    <button className="danger" onClick={() => deleteBrowserDraft(draft.id)}>Delete</button>
+                  </div>
+                </article>
+              ))
+            )}
+          </div>
+        </aside>
+      );
+    }
+
+    return null;
+  }
+
   function renderHeading(
     block: ReaderBlock,
     children: ReactNode,
-    editableProps: {
-      contentEditable: boolean;
-      suppressContentEditableWarning: boolean;
-      onBlur: (event: FocusEvent<HTMLElement>) => void;
-      onKeyDown: (event: ReactKeyboardEvent<HTMLElement>) => void;
-    },
   ) {
     const props = {
       key: block.id,
-      className: "reader-block",
+      className: "reader-node",
       "data-block-id": block.id,
+      "data-text-start": block.textStart,
       ref: (element: HTMLElement | null) => {
         readerBlockRefs.current[block.id] = element;
       },
-      ...editableProps,
+      contentEditable: true,
+      suppressContentEditableWarning: true,
+      onFocus: (event: FocusEvent<HTMLElement>) => rememberPreviewSelection(block, event.currentTarget),
+      onMouseUp: (event: ReactMouseEvent<HTMLElement>) => rememberPreviewSelection(block, event.currentTarget),
+      onKeyUp: (event: ReactKeyboardEvent<HTMLElement>) => rememberPreviewSelection(block, event.currentTarget),
+      onInput: (event: FormEvent<HTMLElement>) => handlePreviewInput(block, event.currentTarget),
+      onBlur: (event: FocusEvent<HTMLElement>) => handlePreviewInput(block, event.currentTarget, true),
+      onKeyDown: (event: ReactKeyboardEvent<HTMLElement>) => handleReaderKeyDown(event, block),
     };
 
     switch (block.level) {
@@ -817,7 +1097,7 @@ export function App() {
     return block.inlines.map((inline, index) => (
       <span
         key={`${inline.start}-${inline.end}-${index}`}
-        className={`reader-text ${inline.commentId ? `comment-highlight ${categoryClass(inline.commentCategory ?? "note")}` : ""} ${
+        className={`reader-inline ${inline.commentId ? `comment-highlight ${categoryClass(inline.commentCategory ?? "note")}` : ""} ${
           inline.commentId === activeCommentId ? "active-highlight" : ""
         }`}
         data-source-start={inline.start}
@@ -848,6 +1128,125 @@ export function App() {
     prefix.selectNodeContents(element);
     prefix.setEnd(range.startContainer, range.startOffset);
     return prefix.toString().length;
+  }
+
+  function getCaretOffsetWithin(element: HTMLElement, node: Node, offset: number) {
+    const range = document.createRange();
+    range.selectNodeContents(element);
+    range.setEnd(node, offset);
+    return range.toString().length;
+  }
+
+  function flattenReaderBlocks(blocks: ReaderBlock[]) {
+    return blocks.flatMap((block) => block.listItems?.length ? block.listItems : [block]);
+  }
+
+  function getSelectionReaderBlock(node: Node | null) {
+    const element =
+      node?.nodeType === Node.TEXT_NODE ? node.parentElement : (node as Element | null);
+    const blockElement = element?.closest<HTMLElement>("[data-block-id]");
+    const blockId = blockElement?.dataset.blockId;
+    if (!blockId) return null;
+    return flattenReaderBlocks(readerBlocks).find((block) => block.id === blockId) ?? null;
+  }
+
+  function focusReaderSurfaceAtSource(source: number) {
+    setReaderSelectionBySource(source, source);
+  }
+
+  function setReaderSelectionBySource(start: number, end: number) {
+    const root = previewRef.current;
+    if (!root) return;
+
+    const startPoint = findReaderPoint(start);
+    const endPoint = findReaderPoint(end);
+    if (!startPoint || !endPoint) return;
+
+    const selectionObject = window.getSelection();
+    if (!selectionObject) return;
+
+    const range = document.createRange();
+    range.setStart(startPoint.node, startPoint.offset);
+    range.setEnd(endPoint.node, endPoint.offset);
+    const focusElement = startPoint.node instanceof HTMLElement
+      ? startPoint.node.closest<HTMLElement>("[contenteditable='true']")
+      : startPoint.node.parentElement?.closest<HTMLElement>("[contenteditable='true']");
+    focusElement?.focus();
+    selectionObject.removeAllRanges();
+    selectionObject.addRange(range);
+    readerCaretSource.current = end;
+    readerSelectionSource.current = { start, end };
+  }
+
+  function insertListBreak(block: ReaderBlock, value: string, offset: number) {
+    const parent = readerBlocks.find((candidate) => candidate.listItems?.some((item) => item.id === block.id));
+    if (!parent?.listItems) {
+      const before = value.slice(0, offset);
+      const after = value.slice(offset);
+      const replacement = `${before}\n${block.listMarker}${after}`;
+      return {
+        markdown: replaceBlockText(markdown, block, replacement),
+        nextSource: block.textStart + before.length + (block.listMarker?.length ?? 0) + 1,
+      };
+    }
+
+    const index = parent.listItems.findIndex((item) => item.id === block.id);
+    const currentRaw = markdown.slice(block.textStart, block.textEnd);
+    const rawSplitOffset = Math.max(0, Math.min(currentRaw.length, sourceOffsetForVisibleOffset(block, offset) - block.textStart));
+    const beforeRaw = currentRaw.slice(0, rawSplitOffset);
+    const afterRaw = currentRaw.slice(rawSplitOffset);
+    const rawBodies = parent.listItems.map((item) => markdown.slice(item.textStart, item.textEnd));
+    rawBodies.splice(index, 1, beforeRaw);
+    rawBodies.splice(index + 1, 0, afterRaw);
+
+    let cursor = 0;
+    let nextSource = parent.start;
+    const raw = rawBodies.map((body, itemIndex) => {
+      const marker = parent.kind === "ordered-list" ? `${itemIndex + 1}. ` : parent.listItems?.[Math.min(itemIndex, parent.listItems.length - 1)]?.listMarker ?? block.listMarker ?? "- ";
+      if (itemIndex === index + 1) {
+        nextSource = parent.start + cursor + marker.length;
+      }
+      const line = `${marker}${body}`;
+      cursor += line.length + 1;
+      return line;
+    }).join("\n");
+
+    return {
+      markdown: replaceBlockMarkdown(markdown, parent, raw),
+      nextSource,
+    };
+  }
+
+  function sourceOffsetForVisibleOffset(block: ReaderBlock, visibleOffset: number) {
+    let remaining = visibleOffset;
+    for (const inline of block.inlines) {
+      if (remaining <= inline.text.length) {
+        return inline.start + Math.min(remaining, inline.end - inline.start);
+      }
+      remaining -= inline.text.length;
+    }
+    return block.textEnd;
+  }
+
+  function findReaderPoint(source: number) {
+    const root = previewRef.current;
+    if (!root) return null;
+
+    const spans = root.querySelectorAll<HTMLElement>("[data-source-start][data-source-end]");
+    for (const span of spans) {
+      const start = Number(span.dataset.sourceStart);
+      const end = Number(span.dataset.sourceEnd);
+      if (source < start || source > end) continue;
+      const textNode = span.firstChild;
+      if (!textNode) return { node: span, offset: 0 };
+      return { node: textNode, offset: Math.min(source - start, textNode.textContent?.length ?? 0) };
+    }
+
+    const lastSpan = spans.item(spans.length - 1);
+    if (!lastSpan) return null;
+    const textNode = lastSpan.firstChild;
+    const fallbackOffset = textNode?.textContent?.length ?? lastSpan.textContent?.length ?? 0;
+    return { node: textNode ?? lastSpan, offset: fallbackOffset };
   }
 
   function renderRehearsalBlock(block: ReaderBlock) {
@@ -914,51 +1313,110 @@ export function App() {
         {rehearsalWarning && <div className="rehearsal-warning">{rehearsalWarning}</div>}
         <article
           className={`rehearsal-reader ${rehearsal.running ? "" : "rehearsal-editor"}`}
-          aria-label={rehearsal.running ? "Rehearsal reader" : "Paused rehearsal editor"}
+          aria-label={rehearsal.running ? "Rehearsal live preview" : "Paused rehearsal editor"}
         >
-          {rehearsal.running ? readerBlocks.map(renderRehearsalBlock) : readerBlocks.map(renderReaderBlock)}
+          {rehearsal.running ? readerBlocks.map(renderRehearsalBlock) : renderReaderDocument()}
         </article>
       </main>
     );
   }
 
   return (
-    <main
-      className={`app-shell ${!settings.showEditor ? "editor-hidden" : ""} ${
-        !settings.showReader ? "reader-hidden" : ""
-      } ${!settings.showComments ? "comments-hidden" : ""}`}
-    >
-      <header className="hero">
-        <div>
-          <p className="eyebrow">Local-first Markdown writing</p>
-          <h1>Scriptr</h1>
+    <main className={`app-shell ${focusMode ? "focus-mode" : ""}`}>
+      <header ref={topbarRef} className="topbar">
+        <div className="topbar-brand">
+          <div>
+            <p className="eyebrow">Local-first Markdown writing</p>
+            <input
+              className="file-name-input"
+              aria-label="Current file name"
+              value={fileName}
+              onChange={(event) => renameFile(event.target.value)}
+            />
+          </div>
+          <div className="topbar-meta">
+            <span className="file-chip">{dirty ? "unsaved" : "saved"}</span>
+            <span>{metrics.words} words</span>
+            <span>{metrics.label} at {settings.wpm} wpm</span>
+            <span>{supportLabel}</span>
+          </div>
         </div>
-        <div className="privacy-card">
-          <strong>Your files stay local.</strong>
-          <span>
-            {desktop?.isDesktop
-              ? "Desktop file open/save is available offline."
-              : supportsDirectFiles
-              ? "Direct file open/save is available in this browser."
-              : "This browser uses import/export fallback."}
-          </span>
-        </div>
-      </header>
 
-      <section className="toolbar" aria-label="File and comment actions">
-        <button onClick={newSpeech}>New</button>
-        <button onClick={openFile}>Open</button>
-        <button onClick={saveFile}>Save</button>
-        <button onClick={saveAsFile}>Export</button>
-        <button onClick={downloadCleanMarkdown}>Export Clean</button>
-        <button
-          onClick={() => addContextComment()}
-          title="Shortcuts: Option/Alt-C note, B blocking, V voice, P position"
-        >
-          Comment <kbd>⌥C / Alt-C</kbd>
-        </button>
+        <div className="topbar-controls">
+          <div className="toolbar-group" aria-label="Primary actions">
+            <button onClick={newSpeech}>New</button>
+            <button onClick={openFile}>Open</button>
+            <button onClick={saveFile}>Save</button>
+            <button onClick={saveAsFile}>Export</button>
+            <button onClick={downloadCleanMarkdown}>Clean Export</button>
+          </div>
+
+          <div className="toolbar-group toolbar-group-compact" aria-label="View controls">
+            <button
+              className={primaryView === "editor" ? "ghost-button active" : "ghost-button"}
+              onClick={() => setPrimaryView("editor")}
+            >
+              Editor
+            </button>
+            <button
+              className={primaryView === "split" ? "ghost-button active" : "ghost-button"}
+              onClick={() => setPrimaryView("split")}
+            >
+              Split
+            </button>
+            <button
+              className={primaryView === "preview" ? "ghost-button active" : "ghost-button"}
+              onClick={() => setPrimaryView("preview")}
+            >
+              Live Preview
+            </button>
+            <button
+              className={focusMode ? "ghost-button active" : "ghost-button"}
+              onClick={() => setFocusMode((current) => !current)}
+            >
+              Focus
+            </button>
+          </div>
+
+          <div className="toolbar-group toolbar-group-compact" aria-label="Utility actions">
+            <button
+              onClick={() => addContextComment()}
+              title="Shortcuts: Option/Alt-C note, B blocking, V voice, P position"
+            >
+              Comment ({utilitySummary.comments}) <kbd>⌥C</kbd>
+            </button>
+            <button
+              className={visibleSidebar === "comments" ? "ghost-button active" : "ghost-button"}
+              onClick={() => toggleSidebar("comments")}
+            >
+              Comments ({utilitySummary.comments})
+            </button>
+            <button
+              className={visibleSidebar === "outline" ? "ghost-button active" : "ghost-button"}
+              onClick={() => toggleSidebar("outline")}
+            >
+              Outline ({utilitySummary.outline})
+            </button>
+            <button
+              className={visibleSidebar === "history" ? "ghost-button active" : "ghost-button"}
+              onClick={() => toggleSidebar("history")}
+            >
+              History ({utilitySummary.history})
+            </button>
+            <button
+              className={visibleSidebar === "snapshots" ? "ghost-button active" : "ghost-button"}
+              onClick={() => toggleSidebar("snapshots")}
+            >
+              Snapshots ({utilitySummary.snapshots})
+            </button>
+            <button className={settingsOpen ? "ghost-button active" : "ghost-button"} onClick={() => setSettingsOpen((open) => !open)}>Settings</button>
+            <button className={rehearsalSetupOpen ? "ghost-button active" : "ghost-button"} onClick={() => setRehearsalSetupOpen((open) => !open)}>Rehearsal</button>
+          </div>
+        </div>
+
+        <div className="status-line" aria-live="polite">{status}</div>
         <input ref={importRef} type="file" accept=".md,.markdown,.txt,text/markdown,text/plain" onChange={importFile} hidden />
-      </section>
+      </header>
 
       {settingsOpen && (
         <section className="settings-panel" aria-label="Settings">
@@ -973,52 +1431,30 @@ export function App() {
             />
           </label>
           <label>
-            <input
-              type="checkbox"
-              checked={settings.showEditor}
-              onChange={(event) => updateSettings({ showEditor: event.target.checked })}
-            />
-            Show editor
+            Default view
+            <select value={primaryView} onChange={(event) => setPrimaryView(event.target.value as PrimaryView)}>
+              <option value="editor">Editor</option>
+              <option value="split">Split</option>
+              <option value="preview">Live Preview</option>
+            </select>
           </label>
           <label>
             <input
               type="checkbox"
-              checked={settings.showReader}
-              onChange={(event) => updateSettings({ showReader: event.target.checked })}
+              checked={focusMode}
+              onChange={(event) => setFocusMode(event.target.checked)}
             />
-            Show reader
+            Focus mode
           </label>
           <label>
-            <input
-              type="checkbox"
-              checked={settings.showComments}
-              onChange={(event) => updateSettings({ showComments: event.target.checked })}
-            />
-            Show comments
-          </label>
-          <label>
-            <input
-              type="checkbox"
-              checked={settings.showOutline}
-              onChange={(event) => updateSettings({ showOutline: event.target.checked })}
-            />
-            Show outline
-          </label>
-          <label>
-            <input
-              type="checkbox"
-              checked={settings.showSnapshots}
-              onChange={(event) => updateSettings({ showSnapshots: event.target.checked })}
-            />
-            Show snapshots
-          </label>
-          <label>
-            <input
-              type="checkbox"
-              checked={settings.showHistory}
-              onChange={(event) => updateSettings({ showHistory: event.target.checked })}
-            />
-            Show history
+            Utility panel
+            <select value={activeSidebar ?? "none"} onChange={(event) => setActiveSidebar(event.target.value === "none" ? null : event.target.value as SidebarPanel)}>
+              <option value="none">Hidden</option>
+              <option value="comments">Comments</option>
+              <option value="outline">Outline</option>
+              <option value="history">History</option>
+              <option value="snapshots">Snapshots</option>
+            </select>
           </label>
         </section>
       )}
@@ -1066,191 +1502,69 @@ export function App() {
         </section>
       )}
 
-      <section className="status-row" aria-live="polite">
-        <span>
-          <strong>{fileName}</strong>
-          {dirty ? " - unsaved changes" : " - saved"}
-        </span>
-        <span>{metrics.words} words</span>
-        <span>{metrics.label} at {settings.wpm} wpm</span>
-        <span>{status}</span>
-        <span className="status-actions">
-          <button className="ghost-button" onClick={() => updateSettings({ showHistory: !settings.showHistory })}>History</button>
-          <button className="ghost-button" onClick={() => setRehearsalSetupOpen((open) => !open)}>Rehearsal</button>
-          <button className="ghost-button" onClick={() => setSettingsOpen((open) => !open)}>Settings</button>
-        </span>
-      </section>
-
       <section className="workspace">
-        {settings.showOutline && <aside className="panel outline-panel" aria-label="Outline">
-          <div className="panel-title">
-            <span>Outline</span>
-          </div>
-          {outlineItems.length === 0 ? (
-            <p className="empty">No headings yet. Add #, ##, or ### headings to build an outline.</p>
-          ) : (
-            <nav className="outline-list">
-              {outlineItems.map((item) => (
-                <button
-                  key={item.id}
-                  className={`outline-item outline-level-${Math.min(3, item.level)}`}
-                  onClick={() => focusReaderBlock(item.id)}
-                >
-                  {item.title}
-                </button>
-              ))}
-            </nav>
-          )}
-        </aside>}
+        <div
+          className={`content-stage ${visibleEditor && visibleReader ? "is-split" : "is-single"}`}
+          style={contentStageStyle}
+        >
+          {visibleEditor && <section className="panel editor-panel">
+            <div className="panel-title">
+              <span>Markdown</span>
+            </div>
+            <CodeMirror
+              value={markdown}
+              extensions={editorExtensions}
+              basicSetup={{
+                foldGutter: false,
+                highlightActiveLine: false,
+                highlightActiveLineGutter: false,
+              }}
+              onChange={updateMarkdown}
+              onUpdate={(update) => {
+                const range = update.state.selection.main;
+                lastCommentSource.current = "editor";
+                readerCaretSource.current = null;
+                setSelection({ from: range.from, to: range.to });
+              }}
+              className="markdown-editor"
+              aria-label={editorPanelLabel}
+            />
+          </section>}
 
-        {settings.showEditor && <section className="panel editor-panel">
-          <div className="panel-title">
-            <span>Markdown</span>
-          </div>
-          <CodeMirror
-            value={markdown}
-            extensions={[markdownExtension()]}
-            basicSetup={{
-              foldGutter: false,
-              highlightActiveLine: false,
-              highlightActiveLineGutter: false,
+          {visibleEditor && visibleReader && <div
+            className="splitter"
+            role="separator"
+            aria-label="Resize editor and preview panels"
+            aria-orientation="vertical"
+            onPointerDown={(event) => {
+              splitDragRef.current = { pointerId: event.pointerId };
+              event.currentTarget.setPointerCapture(event.pointerId);
             }}
-            onChange={updateMarkdown}
-            onUpdate={(update) => {
-              const range = update.state.selection.main;
-              lastCommentSource.current = "editor";
-              readerCaretSource.current = null;
-              setSelection({ from: range.from, to: range.to });
+            onPointerMove={(event) => {
+              if (!splitDragRef.current || splitDragRef.current.pointerId !== event.pointerId) return;
+              const stage = event.currentTarget.parentElement;
+              if (!stage) return;
+              const rect = stage.getBoundingClientRect();
+              const nextRatio = (event.clientX - rect.left) / rect.width;
+              setSplitRatio(Math.min(0.75, Math.max(0.25, nextRatio)));
             }}
-            className="markdown-editor"
-          />
-        </section>}
+            onPointerUp={(event) => {
+              if (splitDragRef.current?.pointerId === event.pointerId) {
+                splitDragRef.current = null;
+                event.currentTarget.releasePointerCapture(event.pointerId);
+              }
+            }}
+          />}
 
-        {settings.showReader && <section className="panel preview-panel" aria-label="Document preview">
-          <div className="panel-title">
-            <span>Read Mode</span>
-          </div>
-          <article
-            ref={previewRef}
-            className="speech-preview"
-            aria-label="Editable reader"
-          >
-            {readerBlocks.map(renderReaderBlock)}
-          </article>
-        </section>}
+          {visibleReader && <section className="panel preview-panel" aria-label="Live Preview">
+            <div className="panel-title">
+              <span>Live Preview</span>
+            </div>
+            {renderReaderDocument()}
+          </section>}
+        </div>
 
-        {settings.showComments && <aside className="panel comments-panel" aria-label="Comments">
-          <div className="panel-title">
-            <span>Comments</span>
-          </div>
-          <>
-          {comments.length === 0 ? (
-            <p className="empty">No comments yet. Select text or place your cursor near a word, then press Option/Alt-C.</p>
-          ) : (
-            comments.map((comment) => (
-              <article
-                key={comment.id}
-                ref={(element) => {
-                  commentRefs.current[comment.id] = element;
-                }}
-                className={`comment-card ${comment.status} ${categoryClass(comment.category)} ${
-                  activeCommentId === comment.id ? "active" : ""
-                }`}
-                onClick={() => setActiveCommentId(comment.id)}
-              >
-                <div className="comment-meta">
-                  <span>{comment.anchor}</span>
-                  <span className={`category-chip ${categoryClass(comment.category)}`}>{comment.category}</span>
-                  <span>{comment.status}</span>
-                </div>
-                <label className="category-select">
-                  Category
-                  <select
-                    value={comment.category}
-                    onChange={(event) => changeCommentCategory(comment.id, event.target.value as CommentCategory)}
-                  >
-                    {commentCategories.map((category) => (
-                      <option key={category} value={category}>
-                        {category}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <textarea
-                  value={comment.text}
-                  onChange={(event) => editComment(comment.id, event.target.value)}
-                  aria-label={`Edit comment ${comment.id}`}
-                />
-                <div className="comment-actions">
-                  <button onClick={() => toggleResolved(comment.id)}>
-                    {comment.status === "resolved" ? "Reopen" : "Resolve"}
-                  </button>
-                  <button className="danger" onClick={() => removeComment(comment.id)}>
-                    Delete
-                  </button>
-                </div>
-              </article>
-            ))
-          )}
-          </>
-        </aside>}
-
-        {settings.showSnapshots && <aside className="panel snapshots-panel" aria-label="Snapshots">
-          <div className="panel-title">
-            <span>Snapshots</span>
-          </div>
-          <div className="snapshot-list">
-            <button onClick={createSnapshot}>Create Snapshot</button>
-            {snapshots.length === 0 ? (
-              <p className="empty">No local snapshots for this file/version yet.</p>
-            ) : (
-              snapshots.map((snapshot) => (
-                <article key={snapshot.id} className="snapshot-card">
-                  <div>
-                    <strong>{snapshot.title}</strong>
-                    <span>
-                      {new Date(snapshot.timestamp).toLocaleString()} - {snapshot.wordCount} words -{" "}
-                      {snapshot.commentCount} comments
-                    </span>
-                  </div>
-                  <div className="snapshot-actions">
-                    <button onClick={() => restoreSnapshot(snapshot)}>Restore</button>
-                    <button onClick={() => downloadSnapshot(snapshot)}>Download</button>
-                    <button className="danger" onClick={() => deleteSnapshot(snapshot.id)}>Delete</button>
-                  </div>
-                </article>
-              ))
-            )}
-          </div>
-        </aside>}
-
-        {settings.showHistory && <aside className="panel history-panel" aria-label="Browser autosave history">
-          <div className="panel-title">
-            <span>History</span>
-          </div>
-          <div className="snapshot-list">
-            {browserDrafts.length === 0 ? (
-              <p className="empty">No browser autosaves yet. Edits are saved here automatically.</p>
-            ) : (
-              browserDrafts.map((draft) => (
-                <article key={draft.id} className="snapshot-card">
-                  <div>
-                    <strong>{draft.fileName}</strong>
-                    <span>
-                      {new Date(draft.updatedAt).toLocaleString()} - {draft.wordCount} words -{" "}
-                      {draft.commentCount} comments
-                    </span>
-                  </div>
-                  <div className="snapshot-actions">
-                    <button onClick={() => restoreBrowserDraft(draft)}>Restore</button>
-                    <button onClick={() => downloadBrowserDraft(draft)}>Download</button>
-                    <button className="danger" onClick={() => deleteBrowserDraft(draft.id)}>Delete</button>
-                  </div>
-                </article>
-              ))
-            )}
-          </div>
-        </aside>}
+        {visibleSidebar && renderSidebarPanel()}
       </section>
     </main>
   );

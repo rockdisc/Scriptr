@@ -1,4 +1,5 @@
 import { markdown as markdownExtension } from "@codemirror/lang-markdown";
+import { EditorView } from "@codemirror/view";
 import CodeMirror from "@uiw/react-codemirror";
 import {
   ChangeEvent,
@@ -13,6 +14,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { commentDecorations } from "./commentDecorations";
 import {
   deleteComment,
   exportCleanMarkdown,
@@ -45,12 +47,17 @@ type Settings = {
   wpm: number;
   showEditor: boolean;
   showReader: boolean;
+  cleanComments: boolean;
+  version: number;
 };
 
+const settingsVersion = 2;
 const defaultSettings: Settings = {
   wpm: 140,
   showEditor: true,
   showReader: true,
+  cleanComments: true,
+  version: settingsVersion,
 };
 
 const settingsKey = "scriptr-settings";
@@ -60,11 +67,12 @@ const legacySnapshotKeyPrefix = "speech-writer-snapshots";
 const draftHistoryKey = "scriptr-browser-drafts";
 const splitRatioKey = "scriptr-split-ratio";
 const commentCategories: CommentCategory[] = ["blocking", "voice", "change position", "note"];
-const editorExtensions = [markdownExtension()];
+const markdownEditorExtension = markdownExtension();
 
 type RehearsalMode = "countdown" | "stopwatch";
 type SidebarPanel = "comments" | "outline" | "snapshots" | "history";
 type PrimaryView = "editor" | "preview" | "split";
+type CommentFilter = "open" | "resolved" | "all";
 
 type RehearsalState = {
   open: boolean;
@@ -78,7 +86,18 @@ function loadSettings(): Settings {
   try {
     const raw = localStorage.getItem(settingsKey) ?? localStorage.getItem(legacySettingsKey);
     if (!raw) return defaultSettings;
-    return { ...defaultSettings, ...JSON.parse(raw) };
+    const parsed = JSON.parse(raw) as Partial<Settings>;
+    const migrated = {
+      ...defaultSettings,
+      ...parsed,
+      version: settingsVersion,
+    };
+
+    if ((parsed.version ?? 0) < settingsVersion) {
+      migrated.cleanComments = true;
+    }
+
+    return migrated;
   } catch {
     return defaultSettings;
   }
@@ -168,6 +187,7 @@ export function App() {
   const [rehearsalSetupOpen, setRehearsalSetupOpen] = useState(false);
   const [settings, setSettings] = useState<Settings>(() => loadSettings());
   const [activeSidebar, setActiveSidebar] = useState<SidebarPanel | null>(null);
+  const [commentFilter, setCommentFilter] = useState<CommentFilter>("open");
   const [focusMode, setFocusMode] = useState(false);
   const [splitRatio, setSplitRatio] = useState(() => {
     const raw = localStorage.getItem(splitRatioKey);
@@ -234,6 +254,57 @@ export function App() {
     history: browserDrafts.length,
     snapshots: snapshots.length,
   }), [browserDrafts.length, comments.length, outlineItems.length, snapshots.length]);
+  const visibleCommentCount = useMemo(
+    () => comments.filter((comment) => comment.status === "open").length,
+    [comments],
+  );
+  const filteredComments = useMemo(() => {
+    if (commentFilter === "all") return comments;
+    return comments.filter((comment) => comment.status === commentFilter);
+  }, [commentFilter, comments]);
+  const editorClickExtension = useMemo(
+    () =>
+      EditorView.domEventHandlers({
+        click(event, view) {
+          const position = view.posAtCoords({ x: event.clientX, y: event.clientY });
+          if (position == null) return false;
+
+          const comment = comments
+            .filter(
+              (item) =>
+                item.anchorStart != null &&
+                item.anchorEnd != null &&
+                position >= item.anchorStart &&
+                position <= item.anchorEnd,
+            )
+            .sort((a, b) => {
+              const aSize = (a.anchorEnd ?? 0) - (a.anchorStart ?? 0);
+              const bSize = (b.anchorEnd ?? 0) - (b.anchorStart ?? 0);
+              return aSize - bSize;
+            })[0];
+
+          if (!comment) return false;
+
+          setActiveCommentId(comment.id);
+          setActiveSidebar("comments");
+          if (commentFilter !== "all" && comment.status !== commentFilter) {
+            setCommentFilter(comment.status);
+          }
+
+          return false;
+        },
+      }),
+    [commentFilter, comments],
+  );
+  const editorExtensions = useMemo(
+    () => [
+      markdownEditorExtension,
+      EditorView.lineWrapping,
+      commentDecorations(activeCommentId, settings.cleanComments),
+      editorClickExtension,
+    ],
+    [activeCommentId, editorClickExtension, settings.cleanComments],
+  );
 
   useEffect(() => {
     const handler = (event: BeforeUnloadEvent) => {
@@ -933,10 +1004,23 @@ export function App() {
             <span>Comments</span>
             <button className="ghost-button" onClick={() => setActiveSidebar(null)}>Close</button>
           </div>
+          <div className="comment-filter" aria-label="Comment filter">
+            {(["open", "resolved", "all"] as CommentFilter[]).map((filter) => (
+              <button
+                key={filter}
+                className={commentFilter === filter ? "ghost-button active" : "ghost-button"}
+                onClick={() => setCommentFilter(filter)}
+              >
+                {filter[0].toUpperCase() + filter.slice(1)}
+              </button>
+            ))}
+          </div>
           {comments.length === 0 ? (
             <p className="empty">No comments yet. Select text or place your cursor near a word, then press Option/Alt-C.</p>
+          ) : filteredComments.length === 0 ? (
+            <p className="empty">No {commentFilter} comments.</p>
           ) : (
-            comments.map((comment) => (
+            filteredComments.map((comment) => (
               <article
                 key={comment.id}
                 ref={(element) => {
@@ -1105,7 +1189,13 @@ export function App() {
         data-comment-id={inline.commentId}
         onClick={(event) => {
           const id = event.currentTarget.dataset.commentId;
-          if (id) setActiveCommentId(id);
+          if (!id) return;
+          const comment = comments.find((item) => item.id === id);
+          setActiveCommentId(id);
+          setActiveSidebar("comments");
+          if (comment && commentFilter !== "all" && comment.status !== commentFilter) {
+            setCommentFilter(comment.status);
+          }
         }}
       >
         {inline.text}
@@ -1389,7 +1479,13 @@ export function App() {
               className={visibleSidebar === "comments" ? "ghost-button active" : "ghost-button"}
               onClick={() => toggleSidebar("comments")}
             >
-              Comments ({utilitySummary.comments})
+              Comments ({visibleCommentCount})
+            </button>
+            <button
+              className={settings.cleanComments ? "ghost-button active" : "ghost-button"}
+              onClick={() => updateSettings({ cleanComments: !settings.cleanComments })}
+            >
+              Clean comments
             </button>
             <button
               className={visibleSidebar === "outline" ? "ghost-button active" : "ghost-button"}
